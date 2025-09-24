@@ -24,4 +24,4 @@ min_sdk_version = 34
 target_sdk_version = 34
 label = "Rust Audio Player"
 uses_non_sdk_api = false
-package = "com.example.rustaudioplayer"
+package = "com.milendenev.rustaudioplayer"
