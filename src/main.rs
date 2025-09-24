@@ -1,5 +1,6 @@
-use iced::widget::{button, column, container, row, scrollable, slider, text, Space};
+use iced::widget::{button, column, container, row, scrollable, slider, text, Space, svg};
 use iced::{Element, Length, Result as IcedResult, Task, Subscription};
+use iced::widget::svg::Handle as SvgHandle;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,7 +22,6 @@ fn main() -> IcedResult {
         .run()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum Message {
     ChooseFolder,
@@ -29,6 +29,8 @@ enum Message {
     SelectTrack(usize),
     TogglePlayPause,
     Stop,
+    NextTrack,
+    PrevTrack,
     // Seek bar interactions
     SeekChanged(f32),
     SeekReleased,
@@ -282,6 +284,53 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
         Message::FolderChosen(None) => {
             // user canceled
         }
+        Message::PrevTrack => {
+            // Compute current index before mutable borrow
+            let current_idx = current_index(state);
+            // Previous: if we are >3s into the track, restart; else go to previous track.
+            match &mut state.audio {
+                Ok(engine) => {
+                    if let Some(idx) = current_idx {
+                        let position = engine.current_position();
+                        if position > Duration::from_secs(3) {
+                            let _ = engine.seek_to(Duration::ZERO);
+                            if engine.is_playing() { state.status = Some("Restarted".into()); }
+                        } else if let Some(prev_idx) = prev_index(idx, state.files.len()) {
+                            if let Some(file) = state.files.get(prev_idx) {
+                                state.selected = Some(prev_idx);
+                                if let Err(e) = engine.play_file(&file.path) {
+                                    state.status = Some(e);
+                                } else {
+                                    state.status = Some(format!("Playing"));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        Message::NextTrack => {
+            // Next: advance to next track and play if available.
+            let current_idx = current_index(state).or(state.selected);
+            match &mut state.audio {
+                Ok(engine) => {
+                    if let Some(idx) = current_idx {
+                        if let Some(next_idx) = next_index(idx, state.files.len()) {
+                            if let Some(file) = state.files.get(next_idx) {
+                                state.selected = Some(next_idx);
+                                if let Err(e) = engine.play_file(&file.path) {
+                                    state.status = Some(e);
+                                } else {
+                                    state.status = Some(format!("Playing: {}", file.name));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            }
+        }
         Message::SelectTrack(idx) => {
             if idx >= state.files.len() {
                 return Task::none();
@@ -410,7 +459,31 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
             state.pre_seek_was_playing = false;
         }
         Message::Tick => {
-            // just cause a view refresh; logic uses engine's position
+            // Auto-advance when the current sink finishes.
+            let current_idx = current_index(state).or(state.selected);
+            if let Ok(engine) = &mut state.audio {
+                if let Some(sink) = &engine.sink {
+                    // If playing and became empty => advance
+                    if !sink.is_paused() && sink.empty() {
+                        if let Some(idx) = current_idx {
+                            if let Some(next_idx) = next_index(idx, state.files.len()) {
+                                if let Some(file) = state.files.get(next_idx) {
+                                    state.selected = Some(next_idx);
+                                    if let Err(e) = engine.play_file(&file.path) {
+                                        state.status = Some(e);
+                                    } else {
+                                        state.status = Some(format!("Playing: {}", file.name));
+                                    }
+                                }
+                            } else {
+                                // Reached the end, stop and clear.
+                                engine.stop();
+                                state.status = Some("Playback finished.".into());
+                            }
+                        }
+                    }
+                }
+            }
         }
         Message::None => {}
     }
@@ -425,9 +498,11 @@ fn subscription(_state: &AudioPlayer) -> Subscription<Message> {
 
 fn view(state: &AudioPlayer) -> Element<'_, Message> {
     let header = row![
+        text("Audio Player").size(22),
+        Space::with_width(Length::FillPortion(1)),
         button("Choose Folder").on_press(Message::ChooseFolder),
         Space::with_width(Length::Fixed(12.0)),
-        text(state.folder_display()).size(18)
+        text(state.folder_display()).size(16)
     ]
     .spacing(8)
     .align_y(iced::alignment::Vertical::Center)
@@ -435,10 +510,25 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
 
     // Files list
     let mut files_col = column![];
+    let playing_idx = current_index(state);
+    let (is_playing, is_paused) = match &state.audio {
+        Ok(engine) => {
+            let paused = engine.sink.as_ref().is_some_and(|s| s.is_paused());
+            (engine.is_playing(), paused)
+        }
+        Err(_) => (false, false),
+    };
     for (i, file) in state.files.iter().enumerate() {
         let selected = state.selected == Some(i);
         // Show plain label; selection will be indicated via background color
-        let label = file.name.clone();
+        let mut label = file.name.clone();
+        if Some(i) == playing_idx {
+            if is_paused {
+                label = format!("[PAUSED] {}", label);
+            } else if is_playing {
+                label = format!("[PLAYING] {}", label);
+            }
+        }
         files_col = files_col.push(
             button(text(label))
                 .on_press(Message::SelectTrack(i))
@@ -470,18 +560,63 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
         .height(Length::Fill)
         .width(Length::Fill);
 
-    let play_label = match &state.audio {
-        Ok(engine) => {
-            if engine.is_playing() { "Pause" } else { "Play" }
-        }
-        Err(_) => "Play",
-    };
+    let is_playing_now = match &state.audio { Ok(e) => e.is_playing(), Err(_) => false };
+    // Determine availability of prev/next based on current selection
+    let curr_idx = current_index(state).or(state.selected);
+    let can_prev = curr_idx.map(|i| i > 0).unwrap_or(false);
+    let can_next = curr_idx.map(|i| i + 1 < state.files.len()).unwrap_or(false);
+
+    // Helper to make a round icon button with an SVG
+    fn round_icon_button<'a, M: Clone + 'a>(svg_bytes: &'static [u8], on_press: Option<M>) -> iced::widget::Button<'a, M> {
+        let handle = SvgHandle::from_memory(svg_bytes);
+        let svg_img = svg(handle).width(Length::Fixed(32.0)).height(Length::Fixed(32.0));
+        let content = container(svg_img)
+            .width(Length::Fixed(44.0))
+            .height(Length::Fixed(44.0))
+            .center_x(Length::Fixed(44.0))
+            .center_y(Length::Fixed(44.0));
+        let mut b = button(content)
+            .padding(0)
+            .style(|theme, status| {
+                use iced::widget::button;
+                let mut s = button::secondary(theme, status);
+                s.border.radius = 22.0.into();
+                s
+            });
+        if let Some(msg) = on_press { b = b.on_press(msg); }
+        b
+    }
+
+    // Embed SVGs at compile-time for portability
+    static PLAY_SVG: &[u8] = include_bytes!("../assets/play.svg");
+    static PAUSE_SVG: &[u8] = include_bytes!("../assets/pause.svg");
+    static STOP_SVG: &[u8] = include_bytes!("../assets/stop.svg");
+    static PREV_SVG: &[u8] = include_bytes!("../assets/prev.svg");
+    static NEXT_SVG: &[u8] = include_bytes!("../assets/next.svg");
+
+    let mut prev_btn = round_icon_button(PREV_SVG, None);
+    if can_prev { prev_btn = round_icon_button(PREV_SVG, Some(Message::PrevTrack)); }
+
+    let play_btn = round_icon_button(if is_playing_now { PAUSE_SVG } else { PLAY_SVG }, Some(Message::TogglePlayPause));
+
+    let mut next_btn = round_icon_button(NEXT_SVG, None);
+    if can_next { next_btn = round_icon_button(NEXT_SVG, Some(Message::NextTrack)); }
+
+    let stop_btn = round_icon_button(STOP_SVG, Some(Message::Stop));
+
     let controls = row![
-        button(play_label).on_press(Message::TogglePlayPause),
-        Space::with_width(Length::Fixed(8.0)),
-        button("Stop").on_press(Message::Stop),
+        Space::with_width(Length::Fill),
+        prev_btn,
+        Space::with_width(Length::Fixed(12.0)),
+        play_btn,
+        Space::with_width(Length::Fixed(12.0)),
+        next_btn,
+        Space::with_width(Length::Fixed(20.0)),
+        stop_btn,
+        Space::with_width(Length::Fill),
     ]
     .spacing(8)
+    .align_y(iced::alignment::Vertical::Center)
     .width(Length::Fill);
 
     // Build progress/seek UI
@@ -542,7 +677,7 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
         controls,
         Space::with_height(8),
         progress_row,
-        Space::with_height(8),
+        Space::with_height(12),
         container(files_list)
             .height(Length::Fill)
             .width(Length::Fill)
@@ -551,7 +686,7 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
         status_line
     ]
     .padding(16)
-    .spacing(8)
+    .spacing(10)
     .height(Length::Fill);
 
     container(content)
@@ -574,6 +709,24 @@ impl AudioPlayer {
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| "No folder selected".into())
     }
+}
+
+// Helper: determine the current track index, preferring the engine's current_path if available.
+fn current_index(state: &AudioPlayer) -> Option<usize> {
+    if let Ok(engine) = &state.audio {
+        if let Some(p) = &engine.current_path {
+            return state.files.iter().position(|f| &f.path == p).or(state.selected);
+        }
+    }
+    state.selected
+}
+
+fn next_index(idx: usize, len: usize) -> Option<usize> {
+    if idx + 1 < len { Some(idx + 1) } else { None }
+}
+
+fn prev_index(idx: usize, _len: usize) -> Option<usize> {
+    if idx > 0 { Some(idx - 1) } else { None }
 }
 
 fn scan_audio_files(dir: &Path) -> (Vec<AudioFile>, Option<String>) {

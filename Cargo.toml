@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.13.1", features = ["wgpu", "tokio"] }
+iced = { version = "0.13.1", features = ["wgpu", "tokio", "svg"] }
 rfd = "0.15.4"
 rodio = { version = "0.21.1", features = ["symphonia-all"] }
 symphonia = { version = "0.5.4", features = ["all"] }
