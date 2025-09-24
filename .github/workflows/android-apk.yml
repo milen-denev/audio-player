@@ -66,7 +66,7 @@ jobs:
           NDK_HOME: ${{ steps.ndk.outputs.NDK_PATH }}
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
         run: |
-          cargo apk build --target aarch64-linux-android --verbose
+          cargo apk build --target aarch64-linux-android
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
