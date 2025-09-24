@@ -3,11 +3,22 @@ name = "rust-audio-player"
 version = "0.1.1"
 edition = "2024"
 
+[lib]
+# Library target needed for Android builds (APK expects a shared library)
+# Name will default to package name with '-' replaced by '_' (rust_audio_player)
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 iced = { version = "0.13.1", features = ["wgpu", "tokio", "svg"] }
-rfd = "0.15.4"
 rodio = { version = "0.21.1", features = ["symphonia-all"] }
 symphonia = { version = "0.5.4", features = ["all"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Provides the Android entrypoint and sets up the native activity glue
+ndk-glue = { version = "0.7", default-features = false, features = ["logger"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = "0.15.4"
 
 [profile.release]
 opt-level = 3
