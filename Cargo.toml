@@ -19,15 +19,9 @@ codegen-units = 1
 lto = "fat"
 
 [package.metadata.android]
-build_targets = ["aarch64-linux-android"]
-
-[package.metadata.android.sdk]
+build_targets = "aarch64-linux-android"
 min_sdk_version = 34
 target_sdk_version = 34
-
-[package.metadata.android.application]
 label = "Rust Audio Player"
 uses_non_sdk_api = false
-
-[package.metadata.android.package]
-name = "com.example.rustaudioplayer"
+package = "com.example.rustaudioplayer"
