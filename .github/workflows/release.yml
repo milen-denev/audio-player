@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build rust-audio-player for Linux x64
+        run: cargo build --release -p rust-audio-player
+      - name: Prepare Linux artifact
+        run: cp target/release/rust-audio-player rust-audio-player-linux-x64
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-audio-player-linux-x64
+          path: rust-audio-player-linux-x64
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - name: Build rust-audio-player for Windows x64
+        run: cargo build --release -p rust-audio-player
+      - name: Prepare Windows artifact
+        shell: pwsh
+        run: Copy-Item target\release\rust-audio-player.exe rust-audio-player-windows-x64.exe
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-audio-player-windows-x64
+          path: rust-audio-player-windows-x64.exe
+          if-no-files-found: error
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          pattern: rust-audio-player-*
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/rust-audio-player-linux-x64
+            artifacts/rust-audio-player-windows-x64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
