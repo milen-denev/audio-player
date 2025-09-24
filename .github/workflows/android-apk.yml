@@ -19,10 +19,14 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: sdkmanager --licenses
+        continue-on-error: true
+
       - name: Install Android SDK packages (Build Tools, Platform, NDK)
         shell: bash
         run: |
-          yes | sdkmanager --licenses
           sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
