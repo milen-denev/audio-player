@@ -1,0 +1,622 @@
+use iced::widget::{button, column, container, row, scrollable, slider, text, Space};
+use iced::{Element, Length, Result as IcedResult, Task, Subscription};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+// Symphonia is used to probe duration for formats where rodio's Decoder
+// cannot determine it up-front (e.g., some MP3/streamable formats).
+// This enables the seekbar to work more reliably.
+use symphonia::core::formats::FormatOptions as SymFormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions as SymMetadataOptions;
+use symphonia::core::probe::Hint as SymHint;
+use symphonia::default::get_probe as sym_get_probe;
+use symphonia::core::codecs::DecoderOptions as SymDecoderOptions;
+use symphonia::default::get_codecs as sym_get_codecs;
+
+fn main() -> IcedResult {
+    iced::application("Iced Audio Player", update, view)
+        .subscription(subscription)
+        .run()
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum Message {
+    ChooseFolder,
+    FolderChosen(Option<PathBuf>),
+    SelectTrack(usize),
+    TogglePlayPause,
+    Stop,
+    // Seek bar interactions
+    SeekChanged(f32),
+    SeekReleased,
+    // periodic UI refresh
+    Tick,
+    None,
+}
+
+struct AudioFile {
+    name: String,
+    path: PathBuf,
+}
+
+struct AudioEngine {
+    stream: rodio::stream::OutputStream,
+    sink: Option<rodio::Sink>,
+    now_playing: Option<String>,
+    current_path: Option<PathBuf>,
+    duration: Option<Duration>,
+    start_instant: Option<Instant>,
+    paused_at: Option<Duration>,
+    position_offset: Duration,
+}
+
+impl AudioEngine {
+    fn new() -> Result<Self, String> {
+        // Open the default output stream using the new rodio 0.21 API
+        let stream = rodio::OutputStreamBuilder::open_default_stream()
+            .map_err(|e| format!("Audio output error: {e}"))?;
+        Ok(Self {
+            stream,
+            sink: None,
+            now_playing: None,
+            current_path: None,
+            duration: None,
+            start_instant: None,
+            paused_at: None,
+            position_offset: Duration::ZERO,
+        })
+    }
+
+    fn stop(&mut self) {
+        if let Some(sink) = self.sink.take() {
+            sink.stop();
+        }
+        self.now_playing = None;
+        self.current_path = None;
+        self.duration = None;
+        self.start_instant = None;
+        self.paused_at = None;
+        self.position_offset = Duration::ZERO;
+    }
+
+    fn play_file(&mut self, path: &Path) -> Result<(), String> {
+        self.play_from(path, Duration::ZERO, false)
+    }
+
+    fn play_from(&mut self, path: &Path, position: Duration, resume_paused: bool) -> Result<(), String> {
+        use rodio::Source as _;
+
+        if let Some(sink) = self.sink.take() { sink.stop(); }
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("Failed to open file: {e}"))?;
+        // Decoder::try_from(File) wraps in BufReader and sets byte_len for accurate seeking
+        let decoder = rodio::Decoder::try_from(file)
+            .map_err(|e| format!("Failed to decode audio: {e}"))?;
+
+    // Prefer rodio's duration, but if it's not available, try probing with symphonia.
+    self.duration = decoder.total_duration().or_else(|| probe_duration_with_symphonia(path));
+        let source = decoder.skip_duration(position);
+
+        // Create a sink we can control and append the (possibly skipped) source
+        let sink = rodio::Sink::connect_new(&self.stream.mixer());
+        sink.append(source);
+        self.sink = Some(sink);
+        self.now_playing = Some(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("Unknown")
+                .to_string(),
+        );
+        self.current_path = Some(path.to_path_buf());
+        self.position_offset = position;
+        self.paused_at = None;
+        self.start_instant = Some(Instant::now());
+
+        if resume_paused {
+            if let Some(s) = &self.sink { s.pause(); }
+        }
+
+        Ok(())
+    }
+
+    fn pause(&mut self) {
+        if let Some(s) = &self.sink {
+            if !s.is_paused() {
+                s.pause();
+                let pos = self.current_position();
+                self.paused_at = Some(pos);
+                self.start_instant = None;
+            }
+        }
+    }
+
+    fn resume(&mut self) {
+        if let Some(s) = &self.sink {
+            if s.is_paused() {
+                s.play();
+                if let Some(p) = self.paused_at.take() {
+                    self.position_offset = p;
+                }
+                self.start_instant = Some(Instant::now());
+            }
+        }
+    }
+
+    fn seek_to(&mut self, position: Duration) -> Result<(), String> {
+        let clamped = if let Some(d) = self.duration { position.min(d) } else { position };
+        let was_paused = self.sink.as_ref().is_some_and(|s| s.is_paused());
+        if let Some(path) = self.current_path.clone() {
+            self.play_from(&path, clamped, was_paused)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_playing(&self) -> bool {
+        if let Some(s) = &self.sink {
+            !s.is_paused() && !s.empty()
+        } else {
+            false
+        }
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+
+    fn current_position(&self) -> Duration {
+        if let Some(paused) = self.paused_at {
+            paused
+        } else if let Some(start) = self.start_instant {
+            self.position_offset + start.elapsed()
+        } else {
+            self.position_offset
+        }
+    }
+}
+
+fn probe_duration_with_symphonia(path: &Path) -> Option<Duration> {
+    let mut hint = SymHint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let probed = sym_get_probe()
+        .format(&hint, mss, &SymFormatOptions::default(), &SymMetadataOptions::default())
+        .ok()?;
+    let mut format = probed.format;
+    // Choose the default track or the first track with a sample rate.
+    let track = format
+        .default_track()
+        .cloned()
+        .or_else(|| format.tracks().iter().find(|t| t.codec_params.sample_rate.is_some()).cloned())?;
+
+    let params = &track.codec_params;
+    if let (Some(sr), Some(n_frames)) = (params.sample_rate, params.n_frames) {
+        let secs = n_frames as f64 / sr as f64;
+        return Some(Duration::from_secs_f64(secs));
+    }
+
+    // As a last resort, decode and count frames to compute duration.
+    let mut decoder = sym_get_codecs().make(params, &SymDecoderOptions::default()).ok()?;
+    let mut total_frames: u64 = 0;
+    let mut sr_opt = params.sample_rate;
+    let track_id = track.id;
+
+    while let Ok(packet) = format.next_packet() {
+        if packet.track_id() != track_id { continue; }
+        if let Ok(audio_buf) = decoder.decode(&packet) {
+            total_frames += audio_buf.frames() as u64;
+            let rate = audio_buf.spec().rate;
+            if sr_opt.is_none() { sr_opt = Some(rate); }
+        }
+    }
+
+    let sr = sr_opt?;
+    if total_frames > 0 {
+        return Some(Duration::from_secs_f64(total_frames as f64 / sr as f64));
+    }
+
+    None
+}
+
+struct AudioPlayer {
+    folder: Option<PathBuf>,
+    files: Vec<AudioFile>,
+    selected: Option<usize>,
+    audio: Result<AudioEngine, String>,
+    status: Option<String>,
+    last_click: Option<(usize, Instant)>,
+    // Seek bar state
+    seek_value: f32,
+    is_seeking: bool,
+    last_seek_apply: Option<Instant>,
+    pre_seek_was_playing: bool,
+}
+
+impl Default for AudioPlayer {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            files: Vec::new(),
+            selected: None,
+            audio: AudioEngine::new(),
+            status: None,
+            last_click: None,
+            seek_value: 0.0,
+            is_seeking: false,
+            last_seek_apply: None,
+            pre_seek_was_playing: false,
+        }
+    }
+}
+
+// Update function for iced 0.13 functional API
+fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
+    match message {
+        Message::ChooseFolder => {
+            // Non-blocking async folder picker
+            return Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Choose Music Folder")
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::FolderChosen,
+            );
+        }
+        Message::FolderChosen(Some(path)) => {
+            state.folder = Some(path.clone());
+            let (files, errors) = scan_audio_files(&path);
+            state.files = files;
+            state.selected = if state.files.is_empty() { None } else { Some(0) };
+            state.status = errors;
+        }
+        Message::FolderChosen(None) => {
+            // user canceled
+        }
+        Message::SelectTrack(idx) => {
+            if idx >= state.files.len() {
+                return Task::none();
+            }
+
+            let now = Instant::now();
+            let is_double = state
+                .last_click
+                .as_ref()
+                .map(|(i, t)| *i == idx && now.duration_since(*t) <= Duration::from_millis(300))
+                .unwrap_or(false);
+
+            state.last_click = Some((idx, now));
+
+            // Always set selection on click
+            state.selected = Some(idx);
+
+            if is_double {
+                // Double click: start playing the clicked item
+                if let Ok(engine) = &mut state.audio {
+                    if let Some(file) = state.files.get(idx) {
+                        if let Err(e) = engine.play_file(&file.path) {
+                            state.status = Some(e);
+                        } else {
+                            state.status = Some(format!("Playing: {}", file.name));
+                        }
+                    }
+                }
+            } else {
+                // Single click behavior
+                if let Ok(engine) = &mut state.audio {
+                    if let Some(sink) = &engine.sink {
+                        if engine.is_playing() {
+                            engine.pause();
+                            state.status = Some("Paused".into());
+                        } else if sink.is_paused() {
+                            engine.resume();
+                            state.status = Some("Resumed".into());
+                        }
+                    }
+                }
+            }
+        }
+        Message::TogglePlayPause => {
+            match &mut state.audio {
+                Ok(engine) => {
+                    match &state.selected {
+                        Some(idx) if engine.sink.as_ref().map(|s| s.empty()).unwrap_or(true) => {
+                            // No active audio in sink -> (re)start selected track
+                            if let Some(file) = state.files.get(*idx) {
+                                if let Err(e) = engine.play_file(&file.path) {
+                                    state.status = Some(e);
+                                } else {
+                                    state.status = Some(format!("Playing: {}", file.name));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Toggle pause/resume on existing sink, if any
+                            if let Some(s) = &engine.sink {
+                                if s.is_paused() {
+                                    engine.resume();
+                                    state.status = Some("Resumed".into());
+                                } else {
+                                    engine.pause();
+                                    state.status = Some("Paused".into());
+                                }
+                            } else if let Some(idx) = state.selected {
+                                // No sink yet, start playback of selected
+                                if let Some(file) = state.files.get(idx) {
+                                    if let Err(e) = engine.play_file(&file.path) {
+                                        state.status = Some(e);
+                                    } else {
+                                        state.status = Some(format!("Playing: {}", file.name));
+                                    }
+                                }
+                            } else {
+                                state.status = Some("No track selected.".into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    state.status = Some(format!(
+                        "Audio not initialized: {e}. Try restarting the app."
+                    ));
+                }
+            }
+        }
+        Message::Stop => {
+            if let Ok(engine) = &mut state.audio {
+                engine.stop();
+            }
+            state.status = Some("Stopped.".into());
+        }
+        Message::SeekChanged(value) => {
+            // Update the slider visually; don't perform heavy seeks while dragging.
+            let was_seeking = state.is_seeking;
+            state.seek_value = value.clamp(0.0, 1.0);
+            if !was_seeking {
+                if let Ok(engine) = &mut state.audio {
+                    // Remember whether we were playing and pause during drag for responsiveness.
+                    state.pre_seek_was_playing = engine.is_playing();
+                    engine.pause();
+                }
+            }
+            state.is_seeking = true;
+        }
+        Message::SeekReleased => {
+            // Apply a single seek when the user releases the slider, then resume if needed.
+            if let Ok(engine) = &mut state.audio {
+                if let Some(total) = engine.total_duration() {
+                    let position = Duration::from_secs_f32(total.as_secs_f32() * state.seek_value);
+                    match engine.seek_to(position) {
+                        Ok(()) => {
+                            if state.pre_seek_was_playing {
+                                engine.resume();
+                            }
+                        }
+                        Err(e) => state.status = Some(e),
+                    }
+                }
+            }
+            state.is_seeking = false;
+            state.last_seek_apply = None;
+            state.pre_seek_was_playing = false;
+        }
+        Message::Tick => {
+            // just cause a view refresh; logic uses engine's position
+        }
+        Message::None => {}
+    }
+    // No background task; return none. The UI will refresh on interactions.
+    Task::none()
+}
+
+fn subscription(_state: &AudioPlayer) -> Subscription<Message> {
+    // Refresh UI at ~10 FPS so the progress/time update while playing
+    iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick)
+}
+
+fn view(state: &AudioPlayer) -> Element<'_, Message> {
+    let header = row![
+        button("Choose Folder").on_press(Message::ChooseFolder),
+        Space::with_width(Length::Fixed(12.0)),
+        text(state.folder_display()).size(18)
+    ]
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+
+    // Files list
+    let mut files_col = column![];
+    for (i, file) in state.files.iter().enumerate() {
+        let selected = state.selected == Some(i);
+        // Show plain label; selection will be indicated via background color
+        let label = file.name.clone();
+        files_col = files_col.push(
+            button(text(label))
+                .on_press(Message::SelectTrack(i))
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(move |theme, status| {
+                    use iced::widget::button;
+                    if selected {
+                        // Keep the primary (blue) style but make it visibly darker for selection
+                        let mut style = button::primary(theme, status);
+                        let palette = theme.extended_palette();
+                        let mut c = palette.primary.strong.color;
+                        // Darken the current primary color
+                        let f: f32 = 0.80;
+                        c.r *= f;
+                        c.g *= f;
+                        c.b *= f;
+                        style.background = Some(iced::Background::from(c));
+                        style.text_color = palette.primary.strong.text;
+                        style
+                    } else {
+                        // Regular primary blue for unselected items
+                        button::primary(theme, status)
+                    }
+                }),
+        );
+    }
+    let files_list = scrollable(files_col.spacing(4).width(Length::Fill))
+        .height(Length::Fill)
+        .width(Length::Fill);
+
+    let play_label = match &state.audio {
+        Ok(engine) => {
+            if engine.is_playing() { "Pause" } else { "Play" }
+        }
+        Err(_) => "Play",
+    };
+    let controls = row![
+        button(play_label).on_press(Message::TogglePlayPause),
+        Space::with_width(Length::Fixed(8.0)),
+        button("Stop").on_press(Message::Stop),
+    ]
+    .spacing(8)
+    .width(Length::Fill);
+
+    // Build progress/seek UI
+    let (slider_enabled, slider_value, time_text) = match &state.audio {
+        Ok(engine) => {
+            if let Some(total) = engine.total_duration() {
+                let total_secs = total.as_secs_f32().max(0.001);
+                let ratio = (engine.current_position().as_secs_f32() / total_secs).clamp(0.0, 1.0);
+                let value = if state.is_seeking { state.seek_value } else { ratio };
+                (true, value, format!("{} / {}", format_time(engine.current_position()), format_time(total)))
+            } else {
+                (false, 0.0, String::new())
+            }
+        }
+        Err(_) => (false, 0.0, String::new()),
+    };
+
+    let seek_bar = if slider_enabled {
+        slider(0.0..=1.0, slider_value, Message::SeekChanged)
+            .step(0.001)
+            .on_release(Message::SeekReleased)
+            .width(Length::Fill)
+    } else {
+        slider(0.0..=1.0, 0.0, |_| Message::None).width(Length::Fill)
+    };
+
+    let progress_row = row![seek_bar, Space::with_width(Length::Fixed(8.0)), text(time_text)]
+        .spacing(8)
+        .width(Length::Fill);
+
+    let status_line = {
+        let audio_line = match &state.audio {
+            Ok(engine) => {
+                if let Some(np) = &engine.now_playing {
+                    if engine.sink.as_ref().is_some_and(|s| s.is_paused()) {
+                        format!("Paused: {}", np)
+                    } else {
+                        format!("Now playing: {}", np)
+                    }
+                } else {
+                    "Idle".into()
+                }
+            }
+            Err(e) => format!("Audio init error: {e}"),
+        };
+        let extra = state.status.as_deref().unwrap_or("");
+        let combined = if extra.is_empty() {
+            audio_line
+        } else {
+            format!("{audio_line} — {extra}")
+        };
+        text(combined)
+    };
+
+    let content = column![
+        header,
+        Space::with_height(8),
+        controls,
+        Space::with_height(8),
+        progress_row,
+        Space::with_height(8),
+        container(files_list)
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .padding(4),
+        Space::with_height(8),
+        status_line
+    ]
+    .padding(16)
+    .spacing(8)
+    .height(Length::Fill);
+
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn format_time(dur: Duration) -> String {
+    let secs = dur.as_secs();
+    let m = secs / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}", m, s)
+}
+
+impl AudioPlayer {
+    fn folder_display(&self) -> String {
+        self.folder
+            .as_ref()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "No folder selected".into())
+    }
+}
+
+fn scan_audio_files(dir: &Path) -> (Vec<AudioFile>, Option<String>) {
+    // Filter by common audio extensions. With rodio + symphonia-all, this should cover most use cases.
+    const EXTS: &[&str] = &[
+        "mp3", "flac", "wav", "ogg", "opus", "aac", "m4a", "alac", "aiff", "aif",
+    ];
+
+    let mut files = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    match fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        let path = e.path();
+                        if path.is_file() {
+                            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                                if EXTS.iter().any(|x| x.eq_ignore_ascii_case(ext)) {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("Unknown")
+                                        .to_string();
+                                    files.push(AudioFile { name, path });
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => errors.push(format!("Error reading entry: {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(format!("Failed to read directory: {e}")),
+    }
+
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    let err = if errors.is_empty() {
+        None
+    } else {
+        Some(errors.join("; "))
+    };
+    (files, err)
+}
