@@ -7,6 +7,7 @@ edition = "2024"
 iced = { version = "0.13.1", default-features = false, features = ["wgpu", "tokio", "svg"] }
 rodio = { version = "0.21.1", features = ["symphonia-all"] }
 symphonia = { version = "0.5.4", features = ["all"] }
+rfd = "0.15.4"
 
 [profile.release]
 opt-level = 3

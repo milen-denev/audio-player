@@ -23,7 +23,6 @@ pub fn run() -> IcedResult {
 }
 
 // Platform-specific async folder picker abstraction
-#[cfg(not(target_os = "android"))]
 async fn pick_folder_async() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
         .set_title("Choose Music Folder")
