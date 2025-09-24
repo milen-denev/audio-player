@@ -16,6 +16,8 @@ symphonia = { version = "0.5.4", features = ["all"] }
 [target.'cfg(target_os = "android")'.dependencies]
 # Provides the Android entrypoint and sets up the native activity glue
 ndk-glue = { version = "0.7", default-features = false, features = ["logger"] }
+# Ensure android-activity is compiled with a concrete activity implementation for winit
+android-activity = { version = "0.6", features = ["native-activity"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.15.4"
