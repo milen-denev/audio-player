@@ -32,12 +32,6 @@ async fn pick_folder_async() -> Option<PathBuf> {
         .map(|h| h.path().to_path_buf())
 }
 
-#[cfg(target_os = "android")]
-async fn pick_folder_async() -> Option<PathBuf> {
-    // No folder picker on Android for now; consider using Storage Access Framework via JNI later.
-    None
-}
-
 #[derive(Debug, Clone)]
 enum Message {
     ChooseFolder,

@@ -3,26 +3,10 @@ name = "rust-audio-player"
 version = "0.1.1"
 edition = "2024"
 
-[lib]
-# Library target needed for Android builds (APK expects a shared library)
-# Name will default to package name with '-' replaced by '_' (rust_audio_player)
-crate-type = ["rlib", "cdylib"]
-
 [dependencies]
 iced = { version = "0.13.1", default-features = false, features = ["wgpu", "tokio", "svg"] }
 rodio = { version = "0.21.1", features = ["symphonia-all"] }
 symphonia = { version = "0.5.4", features = ["all"] }
-
-[target.'cfg(target_os = "android")'.dependencies]
-# Provides the Android entrypoint and sets up the native activity glue
-ndk-glue = { version = "0.7", default-features = false, features = ["logger"] }
-# Ensure android-activity is compiled with a concrete activity implementation for winit
-android-activity = { version = "0.6", features = ["native-activity"] }
-# Narrow iced_winit features on Android to avoid platform-specific code not available on Android
-iced_winit = { version = "0.13.0", default-features = false, features = ["program"] }
-
-[target.'cfg(not(target_os = "android"))'.dependencies]
-rfd = "0.15.4"
 
 [profile.release]
 opt-level = 3
@@ -32,11 +16,3 @@ overflow-checks = false
 incremental = false
 codegen-units = 1
 lto = "fat"
-
-[package.metadata.android]
-build_targets = ["aarch64-linux-android"]
-min_sdk_version = 34
-target_sdk_version = 34
-label = "Rust Audio Player"
-uses_non_sdk_api = false
-package = "com.milendenev.rustaudioplayer"
