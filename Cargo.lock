@@ -339,16 +339,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
-name = "audio-player"
-version = "0.1.0"
-dependencies = [
- "iced",
- "rfd",
- "rodio",
- "symphonia",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,6 +3206,16 @@ name = "roxmltree"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "rust-audio-player"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "rfd",
+ "rodio",
+ "symphonia",
+]
 
 [[package]]
 name = "rust-ini"

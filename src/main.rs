@@ -17,7 +17,7 @@ use symphonia::core::codecs::DecoderOptions as SymDecoderOptions;
 use symphonia::default::get_codecs as sym_get_codecs;
 
 fn main() -> IcedResult {
-    iced::application("Iced Audio Player", update, view)
+    iced::application("Rust Audio Player", update, view)
         .subscription(subscription)
         .run()
 }
@@ -516,7 +516,7 @@ fn subscription(_state: &AudioPlayer) -> Subscription<Message> {
 
 fn view(state: &AudioPlayer) -> Element<'_, Message> {
     let header = row![
-        text("Audio Player").size(22),
+        text("Rust Audio Player").size(22),
         Space::with_width(Length::FillPortion(1)),
         button("Choose Folder").on_press(Message::ChooseFolder),
         Space::with_width(Length::Fixed(12.0)),
