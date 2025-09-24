@@ -18,6 +18,8 @@ symphonia = { version = "0.5.4", features = ["all"] }
 ndk-glue = { version = "0.7", default-features = false, features = ["logger"] }
 # Ensure android-activity is compiled with a concrete activity implementation for winit
 android-activity = { version = "0.6", features = ["native-activity"] }
+# Narrow iced_winit features on Android to avoid platform-specific code not available on Android
+iced_winit = { version = "0.13.0", default-features = false, features = ["program"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.15.4"
