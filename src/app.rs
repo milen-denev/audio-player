@@ -749,11 +749,11 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
     let content = column![
         header,
         Space::with_height(8),
-        search_bar,
-        Space::with_height(8),
         controls,
         Space::with_height(8),
         progress_row,
+        Space::with_height(8),
+        search_bar,
         Space::with_height(12),
         container(files_list)
             .height(Length::Fill)
@@ -861,9 +861,10 @@ fn scan_audio_files(dir: &Path) -> (Vec<AudioFile>, Option<String>) {
 }
 
 // --- Tiny config (theme + last folder) ---
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct AppConfig {
     dark_mode: bool,
+    #[serde(with = "opt_path")] // serialize Option<PathBuf> as string path
     last_folder: Option<PathBuf>,
 }
 
@@ -878,35 +879,44 @@ fn config_path() -> Option<PathBuf> {
 fn load_config() -> Option<AppConfig> {
     let path = config_path()?;
     let data = std::fs::read_to_string(path).ok()?;
-    // naive parse: look for fields in a tiny JSON we write ourselves
-    // {"dark_mode":true,"last_folder":"C:\\path"}
-    let dark_mode = data.contains("\"dark_mode\":true");
-    let last_folder = extract_json_string(&data, "last_folder").and_then(|s| {
-        let p = PathBuf::from(s);
-        if p.exists() { Some(p) } else { None }
-    });
-    Some(AppConfig { dark_mode, last_folder })
+    let mut cfg: AppConfig = serde_json::from_str(&data).ok()?;
+    // Validate last folder exists
+    if let Some(ref p) = cfg.last_folder {
+        if !p.exists() {
+            cfg.last_folder = None;
+        }
+    }
+    Some(cfg)
 }
 
 fn save_config(cfg: &AppConfig) {
     if let Some(path) = config_path() {
-        let last = cfg
-            .last_folder
-            .as_ref()
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
-        // escape backslashes for JSON
-        let last_escaped = last.replace('\\', "\\\\");
-        let json = format!("{{\"dark_mode\":{},\"last_folder\":\"{}\"}}", cfg.dark_mode, last_escaped);
-        let _ = std::fs::write(path, json);
+        if let Ok(json) = serde_json::to_string_pretty(cfg) {
+            let _ = std::fs::write(path, json);
+        }
     }
 }
 
-fn extract_json_string(src: &str, key: &str) -> Option<String> {
-    // very small helper: find "key":"value" and return value (no full JSON parsing)
-    let needle = format!("\"{}\":\"", key);
-    let start = src.find(&needle)? + needle.len();
-    let rest = &src[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+// serde helpers for Option<PathBuf> as plain string
+mod opt_path {
+    use super::*;
+    use serde::{Serializer, Deserializer};
+
+    pub fn serialize<S>(val: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match val {
+            Some(p) => s.serialize_some(&p.to_string_lossy()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Option<PathBuf>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+    let opt: Option<String> = <Option<String> as serde::Deserialize>::deserialize(d)?;
+        Ok(opt.map(PathBuf::from))
+    }
 }
