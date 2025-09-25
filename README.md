@@ -1,5 +1,7 @@
 # Rust Audio Player
 
+<img height="550" alt="image" src="https://github.com/user-attachments/assets/89444a97-3fac-4617-80dc-b3a5b6962c76" />
+
 A small cross‑platform desktop audio player built with Iced (wgpu) for the UI and Rodio + Symphonia for audio playback/decoding.
 
 - UI: Iced 0.13 (wgpu backend, async via Tokio)
