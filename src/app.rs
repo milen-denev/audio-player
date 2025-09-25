@@ -19,7 +19,12 @@ use symphonia::default::get_codecs as sym_get_codecs;
 pub fn run() -> IcedResult {
     iced::application("Rust Audio Player", update, view)
         .subscription(subscription)
+        .theme(app_theme)
         .run()
+}
+
+fn app_theme(state: &AudioPlayer) -> iced::Theme {
+    if state.dark_mode { iced::Theme::Dark } else { iced::Theme::Light }
 }
 
 // Platform-specific async folder picker abstraction
@@ -37,6 +42,7 @@ enum Message {
     FolderChosen(Option<PathBuf>),
     SelectTrack(usize),
     TogglePlayPause,
+    ToggleTheme,
     Stop,
     NextTrack,
     PrevTrack,
@@ -251,11 +257,14 @@ struct AudioPlayer {
     pre_seek_was_playing: bool,
     // Search/filter state
     search_query: String,
+    // Theme state
+    dark_mode: bool,
 }
 
 impl Default for AudioPlayer {
     fn default() -> Self {
-        Self {
+        // Start with defaults, then try loading persisted config
+        let mut me = Self {
             folder: None,
             files: Vec::new(),
             selected: None,
@@ -267,7 +276,19 @@ impl Default for AudioPlayer {
             last_seek_apply: None,
             pre_seek_was_playing: false,
             search_query: String::new(),
+            dark_mode: false,
+        };
+        if let Some(cfg) = load_config() {
+            me.dark_mode = cfg.dark_mode;
+            me.folder = cfg.last_folder;
+            if let Some(folder) = me.folder.clone() {
+                let (files, err) = scan_audio_files(&folder);
+                me.files = files;
+                me.selected = if me.files.is_empty() { None } else { Some(0) };
+                me.status = err;
+            }
         }
+        me
     }
 }
 
@@ -284,6 +305,8 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
             state.files = files;
             state.selected = if state.files.is_empty() { None } else { Some(0) };
             state.status = errors;
+            // Persist last folder
+            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone() });
         }
         Message::FolderChosen(None) => {
             // user canceled
@@ -436,6 +459,10 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
             }
             state.status = Some("Stopped.".into());
         }
+        Message::ToggleTheme => {
+            state.dark_mode = !state.dark_mode;
+            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone() });
+        }
         Message::SearchChanged(q) => {
             state.search_query = q;
             // Optionally, maintain selection if still visible. If not visible, keep it unchanged.
@@ -515,16 +542,6 @@ fn subscription(_state: &AudioPlayer) -> Subscription<Message> {
 }
 
 fn view(state: &AudioPlayer) -> Element<'_, Message> {
-    let header = row![
-        text("Rust Audio Player").size(22),
-        Space::with_width(Length::FillPortion(1)),
-        button("Choose Folder").on_press(Message::ChooseFolder),
-        Space::with_width(Length::Fixed(12.0)),
-        text(state.folder_display()).size(16)
-    ]
-    .spacing(8)
-    .align_y(iced::alignment::Vertical::Center)
-    .width(Length::Fill);
 
     // Search bar
     let search_bar = row![
@@ -633,6 +650,11 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
     static STOP_SVG: &[u8] = include_bytes!("../assets/stop.svg");
     static PREV_SVG: &[u8] = include_bytes!("../assets/prev.svg");
     static NEXT_SVG: &[u8] = include_bytes!("../assets/next.svg");
+    static SUN_SVG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sun.svg"));
+    static MOON_SVG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/moon.svg"));
+
+    // Theme toggle button: show opposite of current theme
+    let theme_btn = round_icon_button(if state.dark_mode { SUN_SVG } else { MOON_SVG }, Some(Message::ToggleTheme));
 
     let mut prev_btn = round_icon_button(PREV_SVG, None);
     if can_prev { prev_btn = round_icon_button(PREV_SVG, Some(Message::PrevTrack)); }
@@ -654,6 +676,19 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
         Space::with_width(Length::Fixed(20.0)),
         stop_btn,
         Space::with_width(Length::Fill),
+    ]
+    .spacing(8)
+    .align_y(iced::alignment::Vertical::Center)
+    .width(Length::Fill);
+
+    let header = row![
+        text("Rust Audio Player").size(22),
+        Space::with_width(Length::FillPortion(1)),
+        theme_btn,
+        Space::with_width(Length::Fixed(8.0)),
+        button("Choose Folder").on_press(Message::ChooseFolder),
+        Space::with_width(Length::Fixed(12.0)),
+        text(state.folder_display()).size(16)
     ]
     .spacing(8)
     .align_y(iced::alignment::Vertical::Center)
@@ -823,4 +858,55 @@ fn scan_audio_files(dir: &Path) -> (Vec<AudioFile>, Option<String>) {
         Some(errors.join("; "))
     };
     (files, err)
+}
+
+// --- Tiny config (theme + last folder) ---
+#[derive(Debug)]
+struct AppConfig {
+    dark_mode: bool,
+    last_folder: Option<PathBuf>,
+}
+
+fn config_path() -> Option<PathBuf> {
+    use directories::ProjectDirs;
+    let proj = ProjectDirs::from("dev", "RustSamples", "RustAudioPlayer")?;
+    let dir = proj.config_dir();
+    std::fs::create_dir_all(dir).ok()?;
+    Some(dir.join("settings.json"))
+}
+
+fn load_config() -> Option<AppConfig> {
+    let path = config_path()?;
+    let data = std::fs::read_to_string(path).ok()?;
+    // naive parse: look for fields in a tiny JSON we write ourselves
+    // {"dark_mode":true,"last_folder":"C:\\path"}
+    let dark_mode = data.contains("\"dark_mode\":true");
+    let last_folder = extract_json_string(&data, "last_folder").and_then(|s| {
+        let p = PathBuf::from(s);
+        if p.exists() { Some(p) } else { None }
+    });
+    Some(AppConfig { dark_mode, last_folder })
+}
+
+fn save_config(cfg: &AppConfig) {
+    if let Some(path) = config_path() {
+        let last = cfg
+            .last_folder
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        // escape backslashes for JSON
+        let last_escaped = last.replace('\\', "\\\\");
+        let json = format!("{{\"dark_mode\":{},\"last_folder\":\"{}\"}}", cfg.dark_mode, last_escaped);
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn extract_json_string(src: &str, key: &str) -> Option<String> {
+    // very small helper: find "key":"value" and return value (no full JSON parsing)
+    let needle = format!("\"{}\":\"", key);
+    let start = src.find(&needle)? + needle.len();
+    let rest = &src[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
