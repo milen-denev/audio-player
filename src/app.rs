@@ -4,6 +4,8 @@ use iced::widget::svg::Handle as SvgHandle;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Symphonia is used to probe duration for formats where rodio's Decoder
 // cannot determine it up-front (e.g., some MP3/streamable formats).
@@ -53,6 +55,10 @@ enum Message {
     // periodic UI refresh
     Tick,
     None,
+    // Equalizer
+    ToggleEq,
+    EqBandChanged(usize, f32),
+    EqClose,
 }
 
 struct AudioFile {
@@ -69,6 +75,8 @@ struct AudioEngine {
     start_instant: Option<Instant>,
     paused_at: Option<Duration>,
     position_offset: Duration,
+    // Equalizer state
+    eq: Arc<Equalizer>, // shared with UI for live updates
 }
 
 impl AudioEngine {
@@ -85,6 +93,7 @@ impl AudioEngine {
             start_instant: None,
             paused_at: None,
             position_offset: Duration::ZERO,
+            eq: Arc::new(Equalizer::default()),
         })
     }
 
@@ -115,13 +124,20 @@ impl AudioEngine {
         let decoder = rodio::Decoder::try_from(file)
             .map_err(|e| format!("Failed to decode audio: {e}"))?;
 
-    // Prefer rodio's duration, but if it's not available, try probing with symphonia.
-    self.duration = decoder.total_duration().or_else(|| probe_duration_with_symphonia(path));
-        let source = decoder.skip_duration(position);
+        // Prefer rodio's duration, but if it's not available, try probing with symphonia.
+        // Avoid re-probing if we already know duration for the same track.
+        let same_track = self.current_path.as_ref().is_some_and(|p| p == path);
+        if !same_track || self.duration.is_none() {
+            self.duration = decoder.total_duration().or_else(|| probe_duration_with_symphonia(path));
+        }
+
+    // Apply EQ by wrapping the source
+    let source = decoder.skip_duration(position);
+    let source = EqSource::new(source, self.eq.clone());
 
         // Create a sink we can control and append the (possibly skipped) source
         let sink = rodio::Sink::connect_new(&self.stream.mixer());
-        sink.append(source);
+    sink.append(source);
         self.sink = Some(sink);
         self.now_playing = Some(
             path.file_name()
@@ -166,12 +182,12 @@ impl AudioEngine {
 
     fn seek_to(&mut self, position: Duration) -> Result<(), String> {
         let clamped = if let Some(d) = self.duration { position.min(d) } else { position };
-        let was_paused = self.sink.as_ref().is_some_and(|s| s.is_paused());
         if let Some(path) = self.current_path.clone() {
+            let was_paused = self.sink.as_ref().is_some_and(|s| s.is_paused());
+            // If position is close to current, do nothing
+            if (self.current_position().as_secs_f32() - clamped.as_secs_f32()).abs() < 0.01 { return Ok(()); }
             self.play_from(&path, clamped, was_paused)
-        } else {
-            Ok(())
-        }
+        } else { Ok(()) }
     }
 
     fn is_playing(&self) -> bool {
@@ -259,6 +275,9 @@ struct AudioPlayer {
     search_query: String,
     // Theme state
     dark_mode: bool,
+    // EQ UI state and bands (gain in dB)
+    eq_visible: bool,
+    eq_gains_db: [f32; 10],
 }
 
 impl Default for AudioPlayer {
@@ -277,10 +296,16 @@ impl Default for AudioPlayer {
             pre_seek_was_playing: false,
             search_query: String::new(),
             dark_mode: false,
+            eq_visible: false,
+            eq_gains_db: [0.0; 10],
         };
         if let Some(cfg) = load_config() {
             me.dark_mode = cfg.dark_mode;
             me.folder = cfg.last_folder;
+            if let Some(eq) = cfg.eq {
+                me.eq_gains_db = eq;
+            }
+            if let Ok(engine) = &mut me.audio { engine.eq.set_gains_db(me.eq_gains_db); }
             if let Some(folder) = me.folder.clone() {
                 let (files, err) = scan_audio_files(&folder);
                 me.files = files;
@@ -306,7 +331,7 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
             state.selected = if state.files.is_empty() { None } else { Some(0) };
             state.status = errors;
             // Persist last folder
-            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone() });
+            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone(), eq: Some(state.eq_gains_db) });
         }
         Message::FolderChosen(None) => {
             // user canceled
@@ -461,8 +486,22 @@ fn update(state: &mut AudioPlayer, message: Message) -> Task<Message> {
         }
         Message::ToggleTheme => {
             state.dark_mode = !state.dark_mode;
-            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone() });
+            save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone(), eq: Some(state.eq_gains_db) });
         }
+        Message::ToggleEq => {
+            state.eq_visible = !state.eq_visible;
+        }
+        Message::EqBandChanged(idx, val) => {
+            // val is slider 0..1 => map to gain range -12..+12 dB, center 0.5 -> 0 dB
+            if idx < state.eq_gains_db.len() {
+                let gain_db = (val - 0.5) * 24.0;
+                state.eq_gains_db[idx] = gain_db;
+                // Update engine's EQ immediately; restart current playback at same position to apply
+                if let Ok(engine) = &mut state.audio { engine.eq.set_gains_db(state.eq_gains_db); }
+                save_config(&AppConfig { dark_mode: state.dark_mode, last_folder: state.folder.clone(), eq: Some(state.eq_gains_db) });
+            }
+        }
+        Message::EqClose => { state.eq_visible = false; }
         Message::SearchChanged(q) => {
             state.search_query = q;
             // Optionally, maintain selection if still visible. If not visible, keep it unchanged.
@@ -650,8 +689,9 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
     static STOP_SVG: &[u8] = include_bytes!("../assets/stop.svg");
     static PREV_SVG: &[u8] = include_bytes!("../assets/prev.svg");
     static NEXT_SVG: &[u8] = include_bytes!("../assets/next.svg");
-    static SUN_SVG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/sun.svg"));
-    static MOON_SVG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/moon.svg"));
+    static SUN_SVG: &[u8] = include_bytes!("../assets/sun.svg");
+    static MOON_SVG: &[u8] = include_bytes!("../assets/moon.svg");
+    static EQ_SVG: &[u8] = include_bytes!("../assets/eq.svg");
 
     // Theme toggle button: show opposite of current theme
     let theme_btn = round_icon_button(if state.dark_mode { SUN_SVG } else { MOON_SVG }, Some(Message::ToggleTheme));
@@ -681,10 +721,13 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
     .align_y(iced::alignment::Vertical::Center)
     .width(Length::Fill);
 
+    let eq_btn = round_icon_button(EQ_SVG, Some(Message::ToggleEq));
     let header = row![
         text("Rust Audio Player").size(22),
         Space::with_width(Length::FillPortion(1)),
         theme_btn,
+        Space::with_width(Length::Fixed(8.0)),
+        eq_btn,
         Space::with_width(Length::Fixed(8.0)),
         button("Choose Folder").on_press(Message::ChooseFolder),
         Space::with_width(Length::Fixed(12.0)),
@@ -746,15 +789,49 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
         text(combined)
     };
 
-    let content = column![
+    // Optional EQ popup panel
+    let eq_popup = if state.eq_visible {
+        let bands_hz: [f32; 10] = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+        let mut sliders = row![];
+        for (i, f) in bands_hz.iter().enumerate() {
+            // Map db -12..+12 to slider 0..1
+            let v = (state.eq_gains_db[i] / 24.0) + 0.5;
+            let v = v.clamp(0.0, 1.0);
+            let s = column![
+                text(format!("{:.0} Hz", f)).size(12),
+                // Use horizontal slider but stack vertically; keep compact width
+                slider(0.0..=1.0, v, move |x| Message::EqBandChanged(i, x))
+                    .step(0.01)
+                    .width(Length::Fixed(140.0)),
+                text(format!("{:+.1} dB", state.eq_gains_db[i])).size(12),
+            ]
+            .spacing(6)
+            .width(Length::Fixed(160.0));
+            sliders = sliders.push(s);
+        }
+        Some(container(
+            column![
+                row![text("Equalizer").size(18), Space::with_width(Length::Fill), button("Close").on_press(Message::EqClose)],
+                Space::with_height(8),
+                sliders.spacing(10)
+            ]
+            .spacing(8)
+            .padding(8)
+        )
+        .width(Length::Fill))
+    } else { None };
+
+    let content_col = column![
         header,
         Space::with_height(8),
         controls,
         Space::with_height(8),
         progress_row,
         Space::with_height(8),
+    if let Some(eq) = eq_popup { eq } else { container(Space::with_height(0)).into() },
+        Space::with_height(8),
         search_bar,
-        Space::with_height(12),
+        Space::with_height(8),
         container(files_list)
             .height(Length::Fill)
             .width(Length::Fill)
@@ -766,7 +843,7 @@ fn view(state: &AudioPlayer) -> Element<'_, Message> {
     .spacing(10)
     .height(Length::Fill);
 
-    container(content)
+    container(content_col)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -866,6 +943,8 @@ struct AppConfig {
     dark_mode: bool,
     #[serde(with = "opt_path")] // serialize Option<PathBuf> as string path
     last_folder: Option<PathBuf>,
+    // Equalizer gains
+    eq: Option<[f32; 10]>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -919,4 +998,119 @@ mod opt_path {
     let opt: Option<String> = <Option<String> as serde::Deserialize>::deserialize(d)?;
         Ok(opt.map(PathBuf::from))
     }
+}
+
+// ===== Equalizer implementation =====
+#[derive(Clone, Copy)]
+struct BiquadCoeffs { b0: f32, b1: f32, b2: f32, a1: f32, a2: f32 }
+
+#[derive(Clone, Copy, Default)]
+struct BiquadState { z1: f32, z2: f32 }
+
+impl BiquadState {
+    fn process(&mut self, x: f32, c: BiquadCoeffs) -> f32 {
+        // Direct Form I transposed
+        let y = c.b0 * x + self.z1;
+        self.z1 = c.b1 * x - c.a1 * y + self.z2;
+        self.z2 = c.b2 * x - c.a2 * y;
+        y
+    }
+}
+
+fn peaking_eq(sr: f32, f0: f32, q: f32, gain_db: f32) -> BiquadCoeffs {
+    let a = 10f32.powf(gain_db / 40.0);
+    let w0 = 2.0 * std::f32::consts::PI * (f0 / sr);
+    let alpha = w0.sin() / (2.0 * q);
+    let cosw = w0.cos();
+
+    let b0 = 1.0 + alpha * a;
+    let b1 = -2.0 * cosw;
+    let b2 = 1.0 - alpha * a;
+    let a0 = 1.0 + alpha / a;
+    let a1 = -2.0 * cosw;
+    let a2 = 1.0 - alpha / a;
+
+    let inv_a0 = 1.0 / a0;
+    BiquadCoeffs { b0: b0 * inv_a0, b1: b1 * inv_a0, b2: b2 * inv_a0, a1: a1 * inv_a0, a2: a2 * inv_a0 }
+}
+
+struct Equalizer {
+    gains_db: Mutex<[f32; 10]>,
+    version: AtomicU64,
+}
+impl Default for Equalizer { fn default() -> Self { Self { gains_db: Mutex::new([0.0; 10]), version: AtomicU64::new(0) } } }
+impl Equalizer {
+    fn set_gains_db(&self, gains: [f32; 10]) {
+        if let Ok(mut g) = self.gains_db.lock() { *g = gains; }
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+    fn snapshot_gains(&self) -> [f32; 10] {
+        self.gains_db.lock().map(|g| *g).unwrap_or([0.0; 10])
+    }
+}
+
+struct EqSource<S: rodio::Source> {
+    inner: S,
+    // Per-band coefficients at current sample rate
+    coeffs: [BiquadCoeffs; 10],
+    // Stereo states for each band
+    l: [BiquadState; 10],
+    r: [BiquadState; 10],
+    next_left: bool,
+    shared: Arc<Equalizer>,
+    last_version: u64,
+    // Small fade-in to mask discontinuity on (re)start
+    fade_len: u32,
+    fade_idx: u32,
+}
+
+impl<S: rodio::Source> EqSource<S> {
+    fn new(inner: S, shared: Arc<Equalizer>) -> Self {
+        let sr = inner.sample_rate() as f32;
+        let freqs = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+        let q = 1.0; // broad bands
+        let mut coeffs = [BiquadCoeffs { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }; 10];
+        let gains = shared.snapshot_gains();
+        for i in 0..10 { coeffs[i] = peaking_eq(sr, freqs[i], q, gains[i]); }
+        let last_version = shared.version.load(Ordering::Relaxed);
+        let fade_len = ((sr * 0.005).ceil() as u32).max(1);
+        Self { inner, coeffs, l: [BiquadState::default(); 10], r: [BiquadState::default(); 10], next_left: true, shared, last_version, fade_len, fade_idx: 0 }
+    }
+}
+
+impl<S: rodio::Source<Item = f32>> Iterator for EqSource<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut x = self.inner.next()?;
+        // Refresh coeffs if updated
+        let current_version = self.shared.version.load(Ordering::Relaxed);
+        if current_version != self.last_version {
+            let sr = self.inner.sample_rate() as f32;
+            let freqs = [31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0];
+            let q = 1.0;
+            let gains = self.shared.snapshot_gains();
+            for i in 0..10 { self.coeffs[i] = peaking_eq(sr, freqs[i], q, gains[i]); }
+            self.last_version = current_version;
+        }
+        if self.next_left {
+            for i in 0..10 { x = self.l[i].process(x, self.coeffs[i]); }
+        } else {
+            for i in 0..10 { x = self.r[i].process(x, self.coeffs[i]); }
+        }
+        // Apply fade-in ramp
+        if self.fade_idx < self.fade_len {
+            let t = self.fade_idx as f32 / self.fade_len as f32;
+            x *= t;
+            self.fade_idx += 1;
+        }
+        self.next_left = !self.next_left;
+        Some(x)
+    }
+}
+
+impl<S: rodio::Source<Item = f32>> rodio::Source for EqSource<S> {
+    fn channels(&self) -> u16 { self.inner.channels() }
+    fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+    fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
 }
